@@ -276,6 +276,44 @@ async def excel_to_pdf(file: UploadFile = File(...)):
         cleanup(src)
 
 
+# ── OCR PDF ──────────────────────────────────────────────────────────────────
+
+@app.post("/api/ocr-pdf")
+async def ocr_pdf(file: UploadFile = File(...)):
+    """
+    Run OCR on a scanned PDF using ocrmypdf (Tesseract under the hood).
+    Returns a searchable PDF with invisible text layer.
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "PDF file required")
+
+    src = save_upload(file, ".pdf")
+    out = TEMP_DIR / f"{uuid.uuid4().hex}_ocr.pdf"
+    try:
+        cmd = [
+            "ocrmypdf",
+            "--skip-text",          # skip pages that already have text
+            "--optimize", "1",
+            "--output-type", "pdf",
+            str(src), str(out)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode not in (0, 6):  # 6 = already has text (ok)
+            raise RuntimeError(result.stderr or "OCR failed")
+        # If output wasn't created (all pages skipped), return original
+        if not out.exists():
+            out = src
+        return FileResponse(
+            str(out), media_type="application/pdf",
+            filename=Path(file.filename).stem + "_ocr.pdf"
+        )
+    except Exception as e:
+        cleanup(src, out)
+        raise HTTPException(500, f"OCR failed: {e}")
+    finally:
+        cleanup(src)
+
+
 # ── RUN ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

@@ -7,6 +7,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-impress \
     libreoffice-calc \
     poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-hin \
+    ocrmypdf \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
