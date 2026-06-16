@@ -2,6 +2,9 @@
 DocKit Backend — FastAPI
 Handles: PDF↔Word, PDF↔PPT, PDF↔Excel conversions via LibreOffice + pdf2docx
 Deploy on Railway / Render / any cloud VPS
+
+SECURITY: Dual-layer CORS (Website origin + Mobile app null/capacitor origin)
+         + X-App-Token verification for request authenticity
 """
 
 import os
@@ -9,23 +12,94 @@ import uuid
 import shutil
 import subprocess
 import tempfile
+import secrets
+import time
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pdf2docx import Converter as PDF2DocxConverter
 
 app = FastAPI(title="DocKit API", version="1.0.0")
 
-# ── CORS — allow all origins (frontend can be anywhere) ──────────────────────
+# ── SECURITY CONFIG ───────────────────────────────────────────────────────
+# App token: shared secret embedded in website JS + mobile app config.
+# This is NOT a substitute for real auth (it's visible in client code),
+# but it blocks casual scrapers/bots that don't bother inspecting JS/app,
+# and lets you tell legit app/website traffic apart from random hits.
+APP_TOKEN = os.environ.get("APP_TOKEN", "dockit-secret-2026-change-me")
+
+# Origins allowed to call the API from a browser (Website layer)
+WEB_ORIGINS = [
+    "https://pdfdockit.toolexpress.online",
+    "https://www.pdfdockit.toolexpress.online",
+]
+
+# Mobile apps (Capacitor) send Origin as "null", "capacitor://localhost",
+# "http://localhost", or no Origin header at all — never a real domain.
+MOBILE_ORIGINS = [
+    "capacitor://localhost",
+    "http://localhost",
+    "https://localhost",
+    "null",
+]
+
+ALL_ORIGINS = WEB_ORIGINS + MOBILE_ORIGINS
+
+# ── CORS — Dual layer: website origins + mobile app origins ─────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALL_ORIGINS,
+    allow_credentials=False,  # no cookies used, keep False with explicit origins
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+# ── APP TOKEN VERIFICATION MIDDLEWARE ────────────────────────────────────────
+# Every request must carry X-App-Token header matching APP_TOKEN.
+# Health check + docs are exempt so monitoring/uptime services still work.
+EXEMPT_PATHS = {"/api/health", "/docs", "/openapi.json", "/redoc"}
+
+@app.middleware("http")
+async def verify_app_token(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in EXEMPT_PATHS:
+        return await call_next(request)
+
+    token = request.headers.get("x-app-token")
+    if not token or not secrets.compare_digest(token, APP_TOKEN):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized: missing or invalid X-App-Token"},
+        )
+    return await call_next(request)
+
+
+# ── SIMPLE RATE LIMIT (per-IP, in-memory) ────────────────────────────────────
+# Lightweight abuse guard. For production scale, swap for Redis-backed limiter.
+_rate_buckets: dict[str, list[float]] = {}
+RATE_LIMIT = 20          # max requests
+RATE_WINDOW = 60         # per 60 seconds
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    if request.url.path in EXEMPT_PATHS or request.method == "OPTIONS":
+        return await call_next(request)
+
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    bucket = _rate_buckets.setdefault(client_ip, [])
+    # drop timestamps outside the window
+    bucket[:] = [t for t in bucket if now - t < RATE_WINDOW]
+    if len(bucket) >= RATE_LIMIT:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests. Please slow down."},
+        )
+    bucket.append(now)
+    return await call_next(request)
+
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "dockit"
 TEMP_DIR.mkdir(exist_ok=True)
@@ -75,8 +149,7 @@ def cleanup(*paths):
 
 @app.get("/api/health")
 def health():
-    """Frontend pings this to check if server is online."""
-    # Check LibreOffice available
+    """Frontend pings this to check if server is online. No token required."""
     lo = shutil.which("libreoffice") or shutil.which("soffice")
     return {
         "status": "online",
