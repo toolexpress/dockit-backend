@@ -36,13 +36,13 @@ WEB_ORIGINS = [
     "https://www.pdfdockit.toolexpress.online",
 ]
 
-# Mobile apps (Capacitor) send Origin as "null", "capacitor://localhost",
-# "http://localhost", or no Origin header at all — never a real domain.
+# Capacitor apps load their bundle from capacitor://localhost (Android)
+# or capacitor://localhost / ionic:// (iOS varies by config). We still
+# list it in CORS so the browser-level preflight succeeds, but the
+# enforce_origin middleware below is the REAL gate — it also requires
+# the X-Client: app header that only the packaged app sends.
 MOBILE_ORIGINS = [
     "capacitor://localhost",
-    "http://localhost",
-    "https://localhost",
-    "null",
 ]
 
 ALL_ORIGINS = WEB_ORIGINS + MOBILE_ORIGINS
@@ -56,12 +56,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+EXEMPT_PATHS = {"/api/health", "/docs", "/openapi.json", "/redoc"}
+
+# ── ORIGIN ENFORCEMENT (anti file-copy / anti-clone) ─────────────────────────
+# CORS headers alone don't stop someone from saving the HTML and opening it
+# locally (file:// or via a random localhost dev server) — a plain HTTP
+# client (curl, Postman, copied HTML) never sends a browser-checked CORS
+# preflight at all. This middleware adds a real server-side check:
+#   - Browser requests must carry an Origin or Referer header.
+#   - That header must match an allowed website domain OR look like the
+#     real Capacitor app (capacitor://localhost) PLUS a custom header the
+#     app sets (X-Client: app).
+#   - "null" Origin (file:// pages) and bare "http://localhost" are
+#     rejected outright — a casual HTML copy won't have a way to pass
+#     Case 2 below unless it also steals the token AND the header,
+#     which raises the bar significantly.
+ALLOWED_WEB_HOSTS = {"pdfdockit.toolexpress.online", "www.pdfdockit.toolexpress.online"}
+
+@app.middleware("http")
+async def enforce_origin(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in EXEMPT_PATHS:
+        return await call_next(request)
+
+    origin = request.headers.get("origin", "")
+    referer = request.headers.get("referer", "")
+    client_type = request.headers.get("x-client", "")  # set to "app" by the Capacitor build
+
+    # Case 1: Real website — Origin or Referer host matches our domain.
+    if any(h in origin for h in ALLOWED_WEB_HOSTS) or any(h in referer for h in ALLOWED_WEB_HOSTS):
+        return await call_next(request)
+
+    # Case 2: Real Capacitor app — custom scheme + the app's own header.
+    if origin.startswith("capacitor://") and client_type == "app":
+        return await call_next(request)
+
+    # Case 3: null / localhost / missing origin (copied HTML opened locally,
+    # or a script with no browser at all) — reject.
+    return JSONResponse(
+        status_code=403,
+        content={"detail": "Forbidden: request did not originate from the official app or website."},
+    )
+
 
 # ── APP TOKEN VERIFICATION MIDDLEWARE ────────────────────────────────────────
 # Every request must carry X-App-Token header matching APP_TOKEN.
 # Health check + docs are exempt so monitoring/uptime services still work.
-EXEMPT_PATHS = {"/api/health", "/docs", "/openapi.json", "/redoc"}
-
 @app.middleware("http")
 async def verify_app_token(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in EXEMPT_PATHS:
